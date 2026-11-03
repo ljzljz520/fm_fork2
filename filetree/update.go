@@ -227,7 +227,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 
 			return m, tea.Sequence(
-				unzipDirectoryCmd(m.files[m.Cursor].Name),
+				unzipDirectoryCmd(m.files[m.Cursor].Path),
 				m.GetDirectoryListingCmd(m.CurrentDirectory),
 			)
 		case key.Matches(msg, m.keyMap.ShowDirectoriesOnly):

@@ -316,73 +316,296 @@ func Zip(name string) error {
 	return errors.Unwrap(err)
 }
 
-// Unzip unzips a directory given a name.
-func Unzip(name string) error {
-	var output string
+// Extraction limits protect against corrupted or malicious archives such as
+// zip bombs. They are variables instead of constants so that tests can use
+// smaller values.
+var (
+	maxUnzipEntries = 10_000
+	maxUnzipBytes   = int64(1 << 30) // 1 GiB
+)
 
-	reader, err := zip.OpenReader(name)
+// Unzip extracts a zip archive into a new directory created next to the
+// archive. The selected archive is read from its full path, fully extracted
+// into a private staging directory inside the archive's own directory, and
+// only published with an atomic rename once every entry has been validated
+// and written. Entries containing path traversal, symbolic links or special
+// file types are rejected, extraction is limited by entry count and total
+// uncompressed size, and any failure removes the staging directory without
+// modifying anything else on disk.
+func Unzip(name string) error {
+	archivePath, err := filepath.Abs(name)
 	if err != nil {
-		return errors.Unwrap(err)
+		return fmt.Errorf("unzip %q: cannot resolve archive path: %w", name, err)
+	}
+
+	// Resolve symlinks so the archive and every path derived from it points
+	// at the real on-disk location rather than writing through a link.
+	archivePath, err = filepath.EvalSymlinks(archivePath)
+	if err != nil {
+		return fmt.Errorf("unzip %q: cannot access archive: %w", name, err)
+	}
+
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return fmt.Errorf("unzip %q: cannot stat archive: %w", name, err)
+	}
+
+	if info.IsDir() {
+		return fmt.Errorf("unzip %q: %s is a directory, not a zip archive", name, archivePath)
+	}
+
+	archiveDir := filepath.Dir(archivePath)
+	archiveBase := filepath.Base(archivePath)
+	destinationBase := unzipDestinationName(archiveBase)
+
+	if destinationBase == "" {
+		return fmt.Errorf("unzip %q: cannot derive an output directory name from %q", name, archiveBase)
+	}
+
+	destinationPath := filepath.Join(archiveDir, destinationBase)
+
+	reader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("unzip %q: cannot open archive: %w", name, err)
 	}
 
 	defer func() {
-		err = reader.Close()
+		_ = reader.Close()
 	}()
 
-	if strings.HasPrefix(name, ".") {
-		output = strings.Split(name, ".")[1]
-	} else {
-		output = strings.Split(name, ".")[0]
+	// Fail fast instead of extracting when the output directory already
+	// exists. Lstat is used on purpose so that a symbolic link at the
+	// destination is detected instead of being followed.
+	if err := rejectIfDestinationExists(destinationPath); err != nil {
+		return fmt.Errorf("unzip %q: %w", name, err)
 	}
 
-	for _, file := range reader.File {
-		archiveFile := file.Name
-		fpath := filepath.Join(output, archiveFile)
+	// Validate every entry before anything is written to disk and total the
+	// declared uncompressed size for an early zip-bomb check.
+	var declaredBytes uint64
 
-		if !strings.HasPrefix(fpath, filepath.Clean(output)+string(os.PathSeparator)) {
-			return errors.Unwrap(err)
+	for _, file := range reader.File {
+		mode := file.Mode()
+
+		if !mode.IsDir() && !mode.IsRegular() {
+			return fmt.Errorf(
+				"unzip %q: entry %q is a %s, only regular files and directories are allowed",
+				name, file.Name, unsupportedEntryKind(mode),
+			)
 		}
 
-		if file.FileInfo().IsDir() {
-			err = os.MkdirAll(fpath, os.ModePerm)
-			if err != nil {
-				return errors.Unwrap(err)
+		if _, err := safeZipEntryPath(file.Name); err != nil {
+			return fmt.Errorf("unzip %q: %w", name, err)
+		}
+
+		declaredBytes += file.UncompressedSize64
+	}
+
+	if len(reader.File) > maxUnzipEntries {
+		return fmt.Errorf(
+			"unzip %q: archive contains %d entries, extraction limit is %d entries",
+			name, len(reader.File), maxUnzipEntries,
+		)
+	}
+
+	if declaredBytes > uint64(maxUnzipBytes) {
+		return fmt.Errorf(
+			"unzip %q: archive declares %d uncompressed bytes, extraction limit is %d bytes",
+			name, declaredBytes, maxUnzipBytes,
+		)
+	}
+
+	stagingPath, err := os.MkdirTemp(archiveDir, "."+archiveBase+".unzip-staging-*")
+	if err != nil {
+		return fmt.Errorf("unzip %q: cannot create staging directory in %q: %w",
+			name, archiveDir, err)
+	}
+
+	// Any return from this point on removes the staging directory so a
+	// corrupt archive, an exceeded limit or a write failure can never leave
+	// a half-extracted result behind.
+	published := false
+
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(stagingPath)
+		}
+	}()
+
+	var totalBytes int64
+
+	for _, file := range reader.File {
+		entryPath, err := safeZipEntryPath(file.Name)
+		if err != nil {
+			return fmt.Errorf("unzip %q: %w", name, err)
+		}
+
+		targetPath := filepath.Join(stagingPath, entryPath)
+		if !withinDirectory(stagingPath, targetPath) {
+			return fmt.Errorf("unzip %q: entry %q escapes the staging directory", name, file.Name)
+		}
+
+		if file.Mode().IsDir() {
+			if err := os.MkdirAll(targetPath, file.Mode().Perm()|0o700); err != nil {
+				return fmt.Errorf("unzip %q: cannot create directory %q: %w", name, file.Name, err)
 			}
 
 			continue
 		}
 
-		if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-			return errors.Unwrap(err)
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return fmt.Errorf("unzip %q: cannot create parent directory for %q: %w", name, file.Name, err)
 		}
 
-		outFile, err := os.OpenFile(filepath.Clean(fpath), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		// O_EXCL guarantees a fresh file inside the brand-new staging
+		// directory: an existing entry can never be truncated or followed.
+		outFile, err := os.OpenFile(
+			targetPath,
+			os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+			file.Mode().Perm()|0o600,
+		)
 		if err != nil {
-			return errors.Unwrap(err)
+			return fmt.Errorf("unzip %q: cannot create file %q: %w", name, file.Name, err)
 		}
 
-		outputFile, err := file.Open()
+		archiveFile, err := file.Open()
 		if err != nil {
-			return errors.Unwrap(err)
+			_ = outFile.Close()
+			return fmt.Errorf("unzip %q: cannot open zip entry %q: %w", name, file.Name, err)
 		}
 
-		_, err = io.Copy(outFile, outputFile)
-		if err != nil {
-			return errors.Unwrap(err)
+		remaining := maxUnzipBytes - totalBytes
+
+		// Read at most one byte beyond the remaining budget so an entry that
+		// lies about its declared size is still detected from the bytes it
+		// actually streams. CRC or compression errors surface here too.
+		limited := &io.LimitedReader{R: archiveFile, N: remaining + 1}
+
+		copied, copyErr := io.Copy(outFile, limited)
+
+		readCloseErr := archiveFile.Close()
+		writeCloseErr := outFile.Close()
+
+		if copyErr != nil {
+			return fmt.Errorf("unzip %q: failed to extract %q, the archive may be corrupt: %w",
+				name, file.Name, copyErr)
 		}
 
-		err = outFile.Close()
-		if err != nil {
-			return errors.Unwrap(err)
+		if readCloseErr != nil {
+			return fmt.Errorf("unzip %q: cannot close zip entry %q: %w", name, file.Name, readCloseErr)
 		}
 
-		err = outputFile.Close()
-		if err != nil {
-			return errors.Unwrap(err)
+		if writeCloseErr != nil {
+			return fmt.Errorf("unzip %q: cannot write file %q: %w", name, file.Name, writeCloseErr)
+		}
+
+		if copied > remaining {
+			return fmt.Errorf(
+				"unzip %q: entry %q exceeds the remaining extraction budget, total limit is %d bytes",
+				name, file.Name, maxUnzipBytes,
+			)
+		}
+
+		totalBytes += copied
+	}
+
+	// Authoritative collision check immediately before publishing: never
+	// replace or follow an existing file, directory or symbolic link.
+	if err := rejectIfDestinationExists(destinationPath); err != nil {
+		return fmt.Errorf("unzip %q: %w", name, err)
+	}
+
+	if err := os.Chmod(stagingPath, 0o755); err != nil {
+		return fmt.Errorf("unzip %q: cannot finalize staging directory: %w", name, err)
+	}
+
+	if err := os.Rename(stagingPath, destinationPath); err != nil {
+		return fmt.Errorf("unzip %q: cannot publish extracted directory: %w", name, err)
+	}
+
+	published = true
+
+	return nil
+}
+
+// unzipDestinationName derives the extracted directory name from an archive
+// file name: a trailing ".zip" extension is removed case-insensitively,
+// otherwise "_unzipped" is appended.
+func unzipDestinationName(archiveBase string) string {
+	if ext := filepath.Ext(archiveBase); strings.EqualFold(ext, ".zip") {
+		return archiveBase[:len(archiveBase)-len(ext)]
+	}
+
+	return archiveBase + "_unzipped"
+}
+
+// safeZipEntryPath validates an entry name stored inside a zip archive and
+// returns the cleaned relative path that may be joined with a destination
+// directory. Absolute paths and any ".." traversal are rejected.
+func safeZipEntryPath(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("zip entry has an empty name")
+	}
+
+	cleaned := filepath.Clean(filepath.FromSlash(name))
+
+	if filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("zip entry %q uses an absolute path", name)
+	}
+
+	for _, part := range strings.Split(cleaned, string(os.PathSeparator)) {
+		if part == ".." {
+			return "", fmt.Errorf("zip entry %q contains path traversal", name)
 		}
 	}
 
-	return errors.Unwrap(err)
+	return cleaned, nil
+}
+
+// withinDirectory reports whether target is root itself or located inside it.
+// Both paths must be cleaned absolute paths.
+func withinDirectory(root, target string) bool {
+	if target == root {
+		return true
+	}
+
+	return strings.HasPrefix(target, root+string(os.PathSeparator))
+}
+
+// rejectIfDestinationExists returns an error when anything already exists at
+// path, including a dangling symbolic link, so extraction never overwrites or
+// follows an existing destination.
+func rejectIfDestinationExists(path string) error {
+	_, err := os.Lstat(path)
+
+	switch {
+	case err == nil:
+		return fmt.Errorf("destination %q already exists, refusing to overwrite it", path)
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	default:
+		return fmt.Errorf("cannot inspect destination %q: %w", path, err)
+	}
+}
+
+// unsupportedEntryKind describes a rejected zip entry type for error messages.
+func unsupportedEntryKind(mode os.FileMode) string {
+	switch {
+	case mode&os.ModeSymlink != 0:
+		return "symbolic link"
+	case mode&os.ModeNamedPipe != 0:
+		return "named pipe"
+	case mode&os.ModeSocket != 0:
+		return "socket"
+	case mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0:
+		return "character device"
+	case mode&os.ModeDevice != 0:
+		return "block device"
+	case mode&os.ModeSetuid != 0 || mode&os.ModeSetgid != 0:
+		return "setuid/setgid file"
+	default:
+		return "special file"
+	}
 }
 
 // CopyFile copies a file given a name.
